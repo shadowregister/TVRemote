@@ -5,7 +5,9 @@ import 'package:go_router/go_router.dart';
 
 import '../../../core/router/app_router.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../remote_control/presentation/remote_provider.dart';
 import '../domain/discovered_device.dart';
+import 'connection_service_provider.dart';
 import 'discovery_provider.dart';
 
 class DiscoveryScreen extends ConsumerStatefulWidget {
@@ -37,11 +39,41 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
 
   Future<void> _connectToDevice(DiscoveredDevice device) async {
     HapticFeedback.mediumImpact();
-    ref.read(connectedDeviceProvider.notifier).state = device;
-    await ref.read(discoveredDevicesProvider.notifier).markDeviceConnected(device.id);
-    if (mounted) {
+
+    // Use the connection service to connect BEFORE navigating
+    final success = await ref
+        .read(connectionAttemptProvider.notifier)
+        .attemptConnection(device);
+
+    if (success && mounted) {
+      // Get the connected controller for handoff
+      final attempt = ref.read(connectionAttemptProvider);
+
+      if (attempt?.controller != null) {
+        // Hand off the pre-connected controller to the remote screen
+        ref.read(activeControllerProvider.notifier).state = attempt!.controller;
+      }
+
+      // Set the connected device
+      ref.read(connectedDeviceProvider.notifier).state = device;
+
+      // Clear the connection attempt state
+      ref.read(connectionAttemptProvider.notifier).clearAfterHandoff();
+
+      // Navigate to remote (already connected!)
       context.go(AppRoutes.remote, extra: device.id);
     }
+    // If not successful, the error state is handled by the connection service
+    // and displayed in the device card
+  }
+
+  void _cancelConnection() {
+    ref.read(connectionAttemptProvider.notifier).cancelConnection();
+  }
+
+  void _retryConnection(DiscoveredDevice device) {
+    ref.read(connectionAttemptProvider.notifier).clearError();
+    _connectToDevice(device);
   }
 
   void _showAddManualDialog() {
@@ -344,23 +376,32 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         return _DeviceCard(
           device: device,
           onTap: () => _connectToDevice(device),
+          onCancel: _cancelConnection,
+          onRetry: () => _retryConnection(device),
         );
       },
     );
   }
 }
 
-class _DeviceCard extends StatefulWidget {
+class _DeviceCard extends ConsumerStatefulWidget {
   final DiscoveredDevice device;
   final VoidCallback onTap;
+  final VoidCallback onCancel;
+  final VoidCallback onRetry;
 
-  const _DeviceCard({required this.device, required this.onTap});
+  const _DeviceCard({
+    required this.device,
+    required this.onTap,
+    required this.onCancel,
+    required this.onRetry,
+  });
 
   @override
-  State<_DeviceCard> createState() => _DeviceCardState();
+  ConsumerState<_DeviceCard> createState() => _DeviceCardState();
 }
 
-class _DeviceCardState extends State<_DeviceCard> {
+class _DeviceCardState extends ConsumerState<_DeviceCard> {
   bool _isPressed = false;
 
   IconData _getBrandIcon() {
@@ -381,6 +422,104 @@ class _DeviceCardState extends State<_DeviceCard> {
     }
   }
 
+  Widget _buildStatusWidget(BuildContext context) {
+    final textSecondary = NeumorphicColors.getTextSecondary(context);
+    final textMuted = NeumorphicColors.getTextMuted(context);
+    final connectionAttempt = ref.watch(connectionAttemptProvider);
+    final isThisDevice = connectionAttempt?.deviceId == widget.device.id;
+
+    switch (widget.device.status) {
+      case ConnectionStatus.connecting:
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: AppTheme.accentColor,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              'Connecting...',
+              style: TextStyle(fontSize: 12, color: textSecondary),
+            ),
+            const SizedBox(width: 8),
+            GestureDetector(
+              onTap: widget.onCancel,
+              child: Container(
+                padding: const EdgeInsets.all(4),
+                decoration: BoxDecoration(
+                  color: NeumorphicColors.getBackground(context),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(Icons.close, size: 16, color: textMuted),
+              ),
+            ),
+          ],
+        );
+
+      case ConnectionStatus.error:
+        final errorMessage = isThisDevice
+            ? (connectionAttempt?.errorMessage ?? 'Connection failed')
+            : 'Connection failed';
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Flexible(
+              child: Text(
+                errorMessage,
+                style: TextStyle(fontSize: 11, color: AppTheme.errorColor),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            const SizedBox(width: 8),
+            GestureDetector(
+              onTap: widget.onRetry,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: AppTheme.accentColor,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Text(
+                  'Retry',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+
+      case ConnectionStatus.connected:
+      case ConnectionStatus.paired:
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            StatusIndicator(isConnected: true),
+            const SizedBox(width: 8),
+            Icon(Icons.chevron_right, color: textMuted),
+          ],
+        );
+
+      case ConnectionStatus.disconnected:
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            StatusIndicator(isConnected: false),
+            const SizedBox(width: 8),
+            Icon(Icons.chevron_right, color: textMuted),
+          ],
+        );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final bgColor = NeumorphicColors.getBackground(context);
@@ -388,16 +527,20 @@ class _DeviceCardState extends State<_DeviceCard> {
     final shadowLight = NeumorphicColors.getShadowLight(context);
     final textPrimary = NeumorphicColors.getTextPrimary(context);
     final textSecondary = NeumorphicColors.getTextSecondary(context);
-    final textMuted = NeumorphicColors.getTextMuted(context);
+
+    // Disable taps while connecting
+    final isConnecting = widget.device.status == ConnectionStatus.connecting;
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 16),
       child: GestureDetector(
-        onTapDown: (_) => setState(() => _isPressed = true),
-        onTapUp: (_) {
-          setState(() => _isPressed = false);
-          widget.onTap();
-        },
+        onTapDown: isConnecting ? null : (_) => setState(() => _isPressed = true),
+        onTapUp: isConnecting
+            ? null
+            : (_) {
+                setState(() => _isPressed = false);
+                widget.onTap();
+              },
         onTapCancel: () => setState(() => _isPressed = false),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 100),
@@ -452,14 +595,7 @@ class _DeviceCardState extends State<_DeviceCard> {
                   ],
                 ),
               ),
-              StatusIndicator(
-                isConnected: widget.device.status != ConnectionStatus.error,
-              ),
-              const SizedBox(width: 8),
-              Icon(
-                Icons.chevron_right,
-                color: textMuted,
-              ),
+              _buildStatusWidget(context),
             ],
           ),
         ),

@@ -11,6 +11,9 @@ import '../domain/remote_command.dart';
 // Connection state that can be watched for changes
 final connectionStateProvider = StateProvider<bool>((ref) => false);
 
+// Holds a pre-connected controller handed off from the discovery screen
+final activeControllerProvider = StateProvider<BaseTvController?>((ref) => null);
+
 // Current TV controller
 final tvControllerProvider = StateNotifierProvider<TvControllerNotifier, BaseTvController?>((ref) {
   final device = ref.watch(connectedDeviceProvider);
@@ -31,6 +34,24 @@ class TvControllerNotifier extends StateNotifier<BaseTvController?> {
   Future<void> _initController() async {
     if (_device == null) return;
 
+    // Check if we have a pre-connected controller from the discovery screen
+    final existingController = _ref.read(activeControllerProvider);
+
+    if (existingController != null && existingController.isConnected) {
+      // Use the existing connected controller (handoff from discovery screen)
+      _connectionSubscription = existingController.connectionStream.listen((isConnected) {
+        _ref.read(connectionStateProvider.notifier).state = isConnected;
+      });
+
+      _ref.read(connectionStateProvider.notifier).state = true;
+      state = existingController;
+
+      // Clear the handoff provider
+      _ref.read(activeControllerProvider.notifier).state = null;
+      return;
+    }
+
+    // Fallback: Create new controller (shouldn't happen with new flow)
     final controller = TvControllerFactory.createController(_device);
     if (controller != null) {
       // Listen to connection state changes
